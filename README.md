@@ -3,7 +3,10 @@
 让 **Qoder IDE 用上你自己的任意第三方模型**（任何 OpenAI 兼容的 `/chat/completions`），
 不依赖官方账号额度。做法是本地 MITM 代理 + 一组可独立开关的 bundle 补丁。
 
-> 仅供自己在自己机器上使用。仓库为私有。
+> 仅供自己在自己机器上使用。
+> 本仓库 fork 自 [Symon12138/qoder-byok-proxy](https://github.com/Symon12138/qoder-byok-proxy)
+> （上游未附带 LICENSE），在其基础上做了 macOS 移植与 OpenCode Go 上游适配；
+> 如需再分发，请先与上游作者确认授权。
 
 ## 它由三部分组成
 
@@ -25,7 +28,7 @@ Qoder IDE ──http.proxy──> 127.0.0.1:8788 ──┬─ 自定义模型 �
 ### Windows
 
 ```powershell
-git clone https://github.com/Symon12138/qoder-byok-proxy.git
+git clone https://github.com/Jefril/qoder-byok-proxy.git
 cd qoder-byok-proxy
 
 # 1. 起服务（首次启动会用 openssl 现场生成 CA 与证书，需要 Git for Windows）
@@ -42,7 +45,7 @@ Copy-Item qoder-proxy\config.example.json qoder-proxy\config.json
 ### macOS
 
 ```bash
-git clone https://github.com/Symon12138/qoder-byok-proxy.git
+git clone https://github.com/Jefril/qoder-byok-proxy.git
 cd qoder-byok-proxy
 
 # 1. 起服务（macOS 自带 openssl 与 sqlite3，装好 Node 即可）
