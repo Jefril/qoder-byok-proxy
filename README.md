@@ -22,6 +22,8 @@ Qoder IDE ──http.proxy──> 127.0.0.1:8788 ──┬─ 自定义模型 �
 
 ## 快速开始
 
+### Windows
+
 ```powershell
 git clone https://github.com/Symon12138/qoder-byok-proxy.git
 cd qoder-byok-proxy
@@ -37,21 +39,46 @@ Copy-Item qoder-proxy\config.example.json qoder-proxy\config.json
 # 4. 应用补丁（需要管理员，会弹 UAC）→「IDE 走代理」→ 重启 Qoder
 ```
 
+### macOS
+
+```bash
+git clone https://github.com/Symon12138/qoder-byok-proxy.git
+cd qoder-byok-proxy
+
+# 1. 起服务（macOS 自带 openssl 与 sqlite3，装好 Node 即可）
+./start.sh                # stop / status / open 子命令同 Windows 版
+
+# 2. 信任 CA：打开 http://127.0.0.1:3426 → 维护 → 信任证书
+#    （系统会弹钥匙串确认，输入登录密码；装进登录钥匙串，不需要 sudo）
+# 3. 配置上游
+cp qoder-proxy/config.example.json qoder-proxy/config.json
+#    改 baseUrl / apiKey / model / displayName
+
+# 4. 应用补丁 →「IDE 走代理」→ 重启 Qoder
+./apply-all.sh            # macOS 上 app 目录属于当前用户，无需提权
+#    回滚：./revert-all.sh
+```
+
 装完之后 Qoder 的模型选择器里会出现名为 `displayName` 的自定义模型。
 
 ## 目录
 
 ```
 qoder-byok-proxy/            ← clone 下来的目录名（本机这份叫 qoder-byok/）
-├─ start.cmd / start.ps1     一键启动/停止/查状态 ← 日常只需要双击这个
-├─ apply-all.ps1             提权打补丁（7 步流水线，内部调用 scripts/）
-├─ revert-all.ps1            提权回滚到官方状态
+├─ start.cmd / start.ps1     一键启动/停止/查状态（Windows）← 日常只需要双击这个
+├─ start.sh                  同上（macOS）
+├─ apply-all.ps1             提权打补丁（Windows，7 步流水线）
+├─ apply-all.sh              打补丁（macOS，无需提权，内部跑 scripts/apply-patches.js）
+├─ revert-all.ps1            提权回滚到官方状态（Windows）
+├─ revert-all.sh             回滚（macOS，内部跑 scripts/revert-patches.js）
 ├─ scripts/                  补丁与模型同步脚本（不直接运行，由 apply-all / 控制台调用）
+│  ├─ qoder-paths.js         跨平台路径与安装目录解析（Windows / macOS 共用）
 │  ├─ experts-patch.js       8 条 bundle 补丁
-│  ├─ run-experts-patch.ps1  apply-all 的中间层：找 node、读配置
-│  ├─ patch-qoder-*.ps1      老一代补丁（byok / url / merge / live）+ 收尾修正
-│  ├─ fix-qoder-checksums.ps1  修 product.json / featureFlags.json 的校验和
-│  └─ sync-qoder-model.ps1   把模型能力写进 Qoder 的 sqlite 模型记录
+│  ├─ apply-patches.js       补丁流水线（跨平台，取代 Windows 版 7 个 ps1 的执行体）
+│  ├─ revert-patches.js      全量回滚（跨平台）
+│  ├─ sync-model.js          把模型能力写进 Qoder 的 sqlite 模型记录（跨平台）
+│  ├─ patch-qoder-*.ps1      老一代补丁（Windows 保留；macOS 走 apply-patches.js）
+│  └─ fix-qoder-checksums.ps1  修 product.json / featureFlags.json 的校验和
 └─ qoder-proxy/              代理 + 控制台 + 文档
    ├─ README.md              ★ 详细文档（配置字段、补丁清单、踩坑记录、排障）
    ├─ config.example.json    配置模板
@@ -67,8 +94,13 @@ qoder-byok-proxy/            ← clone 下来的目录名（本机这份叫 qode
 
 ## 已验证环境
 
-Qoder IDE `1.106.3`（Windows 11）+ Node 24。补丁锚点做过抗变量重命名的加固，
-换版本后先用 `node scripts/experts-patch.js --dry --root "<原始 bundle 所在目录>"` 确认 8 条都还是「待应用」。
+- Qoder IDE `1.106.3`（Windows 11，国际版）+ Node 24
+- Qoder CN IDE `1.106.3`（macOS 24.6，`/Applications/Qoder CN IDE.app`）+ Node 24
+
+补丁锚点做过抗变量重命名的加固；CN 版 bundle 的压缩变量名与国际版不同
+（如 `r`→`n`），byok 四条锚点已全部改为正则捕获组回引。
+换版本后先用 `node scripts/apply-patches.js --dry --root "<安装目录>"` 确认
+各步都还是「待应用」。
 
 ## 详细文档
 

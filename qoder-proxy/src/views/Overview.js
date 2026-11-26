@@ -74,7 +74,9 @@ export default {
       className: 'card--accent',
       children: `
         <div class="flex flex-col gap-3">
-          ${['启动本地代理', '同步模型记录到 IDE', '把 IDE 指向代理', '信任代理证书（Windows 弹一次确认，点「是」）', '应用补丁（需管理员权限）']
+          ${[ '启动本地代理', '同步模型记录到 IDE', '把 IDE 指向代理',
+              state.isMac ? '信任代理证书（系统弹窗确认一次）' : '信任代理证书（Windows 弹一次确认，点「是」）',
+              state.isMac ? '应用补丁（无需提权）' : '应用补丁（需管理员权限）']
             .map((t, i) => `<div class="flex items-center gap-3 text-sm"><span class="icon-box icon-box--muted icon-box--sm">${i + 1}</span><span>${t}</span></div>`)
             .join('')}
         </div>
@@ -313,7 +315,7 @@ export default {
         } else if (act === 'trust-cert') {
           el.disabled = true;
           const origLabel = el.innerHTML;
-          el.innerHTML = '等待确认…（请在弹窗点「是」）';
+          el.innerHTML = state.isMac ? '等待确认…（输入登录密码以信任证书）' : '等待确认…（请在弹窗点「是」）';
           try {
             const r = await api.trustCert();
             await actions.loadStatus();

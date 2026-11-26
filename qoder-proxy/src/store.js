@@ -49,6 +49,8 @@ function createStore(initialState) {
 const initialState = {
   // 状态数据
   status: null,
+  // 后端平台（/api/status 的 platform），文案按平台显示
+  isMac: false,
   models: [],
   modelsSource: '',
   modelsError: '',
@@ -85,6 +87,7 @@ const actions = {
 
     if (statusRes.status === 'fulfilled') {
       state.status = statusRes.value;
+      state.isMac = statusRes.value.platform === 'darwin';
     } else {
       state.error = statusRes.reason?.message || '状态加载失败';
     }
@@ -113,6 +116,7 @@ const actions = {
       state.error = null;
       const data = await api.getStatus();
       state.status = data;
+      state.isMac = data.platform === 'darwin';
       return data;
     } catch (error) {
       state.error = error.message;

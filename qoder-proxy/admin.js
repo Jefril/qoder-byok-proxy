@@ -3,9 +3,13 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn, spawnSync } = require('child_process');
 const net = require('net');
 const crypto = require('crypto');
+const Q = require('../scripts/qoder-paths');
+
+const IS_MAC = Q.IS_MAC;
 
 const DIR = __dirname;
 const CONFIG = path.join(DIR, 'config.json');
@@ -28,17 +32,32 @@ function proxyPort() {
 // 以前写死 'D:\Qoder IDE'。机器上可能同时存在启动器托管的多版本目录
 // （D:\Qoder\.qoder-versions\...）和真正可打补丁的安装目录，写死一个很容易改错地方。
 // 现在优先用配置文件里保存的路径，其次自动探测，最后才退回默认值。
-const WB_REL = path.join('resources', 'app', 'out', 'vs', 'workbench', 'workbench.desktop.main.js');
-const AW_REL = path.join('resources', 'app', 'out', 'lingma', 'agents-window', 'agents-window.desktop.main.js');
-const DEFAULT_IDE_ROOT = 'D:\\Qoder IDE';
+// bundle 路径统一从 app 目录算（Windows: root\resources\app；macOS: .app/Contents/Resources/app），
+// 语义收敛在 qoder-paths.js 里。
+const WB_REL = Q.WB_REL;
+const AW_REL = Q.AW_REL;
+const DEFAULT_IDE_ROOT = IS_MAC ? '/Applications/Qoder CN IDE.app' : 'D:\\Qoder IDE';
+// CA 的 CN，certs.js 生成证书时写死的；macOS 检测钥匙串要用名字初筛再比对指纹
+const CERT_CN = 'Qoder Lab Root CA';
 
 function looksLikeIdeRoot(dir) {
-  try { return !!dir && fs.existsSync(path.join(dir, WB_REL)); } catch { return false; }
+  try { return Q.looksLikeIdeRoot(dir); } catch { return false; }
 }
 
 // 从正在运行的 Qoder 进程反推安装目录：最准，因为它就是用户实际在用的那套
 function detectRootFromProcess() {
   try {
+    if (IS_MAC) {
+      // ps 列出完整命令行，过滤出 Qoder IDE 的主程序路径（不含 Desktop）
+      const r = spawnSync('ps', ['-axo', 'command='], { encoding: 'utf8', timeout: 8000 });
+      const lines = (r.stdout || '').split('\n')
+        .filter((l) => /Qoder.*IDE\.app\/Contents\/MacOS/.test(l));
+      for (const line of lines) {
+        const m = /(^|\s)(\/[^\s]*Qoder[^/\s]*IDE\.app)/.exec(line);
+        if (m && looksLikeIdeRoot(m[2])) return m[2];
+      }
+      return null;
+    }
     const r = spawnSync('powershell', ['-NoProfile', '-Command',
       "Get-CimInstance Win32_Process -Filter \"Name='Qoder.exe' or Name='Qoder IDE.exe'\" | Select-Object -ExpandProperty ExecutablePath"],
       { encoding: 'utf8', timeout: 8000, windowsHide: true });
@@ -58,6 +77,26 @@ function detectRootFromProcess() {
 
 // 常见安装位置 + 启动器的多版本子目录
 function detectRootFromCommonPaths() {
+  if (IS_MAC) {
+    // macOS 的应用只装在 /Applications（或用户自己的 ~/Applications），没有多版本目录
+    const bases = [
+      '/Applications/Qoder CN IDE.app', '/Applications/Qoder IDE.app',
+      '/Applications/Qoder.app',
+      path.join(os.homedir(), 'Applications', 'Qoder CN IDE.app'),
+    ];
+    for (const base of bases) {
+      if (looksLikeIdeRoot(base)) return base;
+    }
+    // 兜底：扫 /Applications 下所有 Qoder*IDE*.app（名字随版本变化时也能找到）
+    try {
+      const hits = fs.readdirSync('/Applications')
+        .filter((d) => /^qoder/i.test(d) && d.endsWith('.app') && /ide/i.test(d))
+        .map((d) => path.join('/Applications', d))
+        .filter(looksLikeIdeRoot);
+      if (hits.length) return hits[0];
+    } catch { /* ignore */ }
+    return null;
+  }
   const roots = [
     'D:\\Qoder IDE', 'C:\\Qoder IDE', 'D:\\Qoder', 'C:\\Qoder',
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Qoder'),
@@ -105,13 +144,13 @@ function resolveIdeRoot(force) {
 }
 
 /**
- * 代理证书状态：读 ca.crt 算指纹，再问 Windows 是否已信任。
- *
- * 用 certutil 的退出码判断（0=在受信任根里，0x80090011=没找到），
- * 不看输出文本 —— 它的输出是 GBK，跨编码解析不可靠。
+ * 代理证书状态：读 ca.crt 算指纹，再问系统是否已信任。
+ *   Windows: certutil 退出码判断（0=在受信任根里，0x80090011=没找到），
+ *            不看输出文本 —— 它的输出是 GBK，跨编码解析不可靠。
+ *   macOS:   security find-certificate 按名字列出证书的 SHA-1，与指纹比对。
  * 指纹用 Node 自带 X509Certificate 算，不依赖 openssl。
  */
-// 证书状态缓存：查询要起 certutil 进程（约 0.15s），而 /api/status 每 5 秒被轮询一次，
+// 证书状态缓存：查询要起外部进程（约 0.15s），而 /api/status 每 5 秒被轮询一次，
 // 每次都 spawn 一次纯属浪费，还会阻塞 0.15s 事件循环。缓存 20 秒。
 let certCache = { at: 0, info: null };
 const CERT_TTL = 20000;
@@ -132,13 +171,23 @@ function computeCertInfo() {
   try {
     const x = new crypto.X509Certificate(fs.readFileSync(caPath));
     const thumb = x.fingerprint.replace(/:/g, '');
-    const r = spawnSync('certutil', ['-user', '-store', 'Root', thumb], {
-      encoding: 'utf8', windowsHide: true, timeout: 15000,
-    });
+    let trusted = false;
+    if (IS_MAC) {
+      // find-certificate 走默认搜索策略域（登录+系统钥匙串）；-a 列出所有同名证书，
+      // 输出里逐块带 "SHA-1 hash:"，直接比对指纹，名字撞了也不会误判。
+      const r = spawnSync('security', ['find-certificate', '-a', '-Z', '-c', CERT_CN],
+        { encoding: 'utf8', timeout: 15000 });
+      trusted = ((r.stdout || '') + (r.stderr || '')).toUpperCase().includes(thumb);
+    } else {
+      const r = spawnSync('certutil', ['-user', '-store', 'Root', thumb], {
+        encoding: 'utf8', windowsHide: true, timeout: 15000,
+      });
+      trusted = r.status === 0;
+    }
     return {
       ok: true,
       exists: true,
-      trusted: r.status === 0,
+      trusted,
       thumbprint: x.fingerprint,
       subject: x.subject.split('\n').pop(),
       expires: x.validTo,
@@ -151,24 +200,29 @@ function computeCertInfo() {
 
 function ideInfo() {
   const root = resolveIdeRoot();
+  const app = Q.appDirOf(root);
   const cfg = loadConfig();
   let version = '';
-  try { version = JSON.parse(fs.readFileSync(path.join(root, 'resources', 'app', 'product.json'), 'utf8')).version || ''; } catch { /* ignore */ }
+  try { version = JSON.parse(fs.readFileSync(path.join(app, 'product.json'), 'utf8')).version || ''; } catch { /* ignore */ }
   return {
     root,
     version,
-    bundleWb: fs.existsSync(path.join(root, WB_REL)),
-    bundleAw: fs.existsSync(path.join(root, AW_REL)),
+    bundleWb: !!app && fs.existsSync(path.join(app, WB_REL)),
+    bundleAw: !!app && fs.existsSync(path.join(app, AW_REL)),
     configured: cfg.ideRoot || '',
     source: cfg.ideRoot ? 'config' : 'auto',
   };
 }
 
-function bundleWb() { return path.join(resolveIdeRoot(), WB_REL); }
-function bundleAw() { return path.join(resolveIdeRoot(), AW_REL); }
-const SETTINGS = path.join(process.env.APPDATA || '', 'Qoder', 'User', 'settings.json');
-const APPJSON = path.join(process.env.APPDATA || '', 'Qoder', 'User', 'app.json');
-const DB = path.join(process.env.APPDATA || '', 'Qoder', 'User', 'globalStorage', 'state.vscdb');
+function bundleWb() { return path.join(Q.appDirOf(resolveIdeRoot()), WB_REL); }
+function bundleAw() { return path.join(Q.appDirOf(resolveIdeRoot()), AW_REL); }
+
+// 用户数据目录（Windows: %APPDATA%\Qoder；macOS: ~/Library/Application Support/<nameShort>）。
+// 做成惰性函数而不是模块级常量：macOS 的目录名要等安装目录探明后才能确定。
+function userDir() { return Q.userDataDir(Q.appDirOf(resolveIdeRoot())); }
+function settingsPath() { return path.join(userDir(), 'User', 'settings.json'); }
+function appJsonPath() { return path.join(userDir(), 'User', 'app.json'); }
+function stateDbPath() { return path.join(userDir(), 'User', 'globalStorage', 'state.vscdb'); }
 // 所有拼进 SQL 的值都必须过这里：单引号翻倍。
 // 起因（对抗测试）：模型记录的 displayName / apiKey 里只要有一个单引号
 // （例如给模型起名 "Bob's model"），UPDATE 语句就会解析失败，
@@ -322,7 +376,8 @@ function patchApplied(id) {
 }
 
 function patchStatus() {
-  const byok = bundleMarkers(bundleWb(), ['_applyByokRemoteEnabledFromResponse(e){const r=!0;', 'checkByokConfig(e,r){return{success:!0};']);
+  // byok 特征用正则：CN 版 bundle 的压缩变量名与国际版不同（r→n），写死字母会误报"未打"
+  const byok = bundleMarkers(bundleWb(), [/_applyByokRemoteEnabledFromResponse\(\w+\)\{const \w+=!0;/, /checkByokConfig\(\w+,\w+\)\{return\{success:!0\};/, /_isCustomModelSupportedByCurrentAccount\(\)\{return!0\}/, /\(\)=>!0\/\*qbp\*\//]);
   // P4 的产物：experts 模式 BYOK 门控被解除（自定义模型改由 Qoder 原生「自定义」分组承载）。
   // 用正则而不是固定字符串：产物里的对象名随构建变化（Q / Y 都见过）。
   const experts = bundleMarkers(bundleAw(), [/useMemo\)\(\(\)=>!1,\[\w+\.userPlan,\w+\.userInfo,\w+\]\)/]);
@@ -359,16 +414,21 @@ async function gatewayModels(cfg) {
     const res = await fetch(url, { headers: { authorization: `Bearer ${up.apiKey || ''}` }, signal: AbortSignal.timeout(6000) });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}`, models: [] };
     const j = await res.json();
-    const models = (j.data || []).map((m) => ({
-      id: m.id,
-      name: m.display_name || m.id,
-      context: m.max_input_tokens || m.context_length || 0,
-      output: m.max_output_tokens || 0,
-      vision: (m.modalities?.input || []).includes('image'),
-      reasoning: !!m.reasoning,
-      levels: m.reasoning_levels || [],
-      tools: !!m.tool_call,
-    }));
+    // 兼容 bigmodel 顶层字段与 opencode 的 limit/capabilities 结构
+    const models = (j.data || []).map((m) => {
+      const caps = m.capabilities || {};
+      const limit = m.limit || {};
+      return {
+        id: m.id,
+        name: m.display_name || m.id,
+        context: m.max_input_tokens || m.context_length || limit.context || 0,
+        output: m.max_output_tokens || limit.output || 0,
+        vision: (m.modalities?.input || []).some((s) => s === 'image' || String(s).startsWith('image/')),
+        reasoning: !!m.reasoning || !!(caps.reasoning && caps.reasoning.supported),
+        levels: m.reasoning_levels || (caps.reasoning && caps.reasoning.effort) || [],
+        tools: !!m.tool_call || !!(caps.tools && caps.tools.supported),
+      };
+    });
     return { ok: true, models };
   } catch (e) {
     return { ok: false, error: e.message, models: [] };
@@ -381,11 +441,11 @@ let recordCache = { mtimeMs: -1, value: null };
 
 function readRecord() {
   let mtimeMs;
-  try { mtimeMs = fs.statSync(DB).mtimeMs; } catch { mtimeMs = -1; }
+  try { mtimeMs = fs.statSync(stateDbPath()).mtimeMs; } catch { mtimeMs = -1; }
   if (mtimeMs === recordCache.mtimeMs) return recordCache.value;
 
   try {
-    const r = spawnSync(SQLITE, [DB, "SELECT value FROM ItemTable WHERE key='aicoding.customModels';"], { encoding: 'utf8', timeout: 8000 });
+    const r = spawnSync(SQLITE, [stateDbPath(), "SELECT value FROM ItemTable WHERE key='aicoding.customModels';"], { encoding: 'utf8', timeout: 8000 });
     const v = (r.stdout || '').trim();
     const value = v ? (() => { try { const a = JSON.parse(v); return Array.isArray(a) ? a : null; } catch { return null; } })() : null;
     recordCache = { mtimeMs, value };
@@ -399,7 +459,7 @@ function readRecord() {
 // Qoder 每次启动会新建一个 logs/<timestamp> 目录，取最新的那个
 function latestLogDir() {
   try {
-    const root = path.join(process.env.APPDATA || '', 'Qoder', 'logs');
+    const root = path.join(userDir(), 'logs');
     const dirs = fs.readdirSync(root, { withFileTypes: true })
       .filter((d) => d.isDirectory())
       .map((d) => ({ name: d.name, t: fs.statSync(path.join(root, d.name)).mtimeMs }))
@@ -417,7 +477,7 @@ function pickUpstream(src) {
 
 function writeRecords(arr) {
   const json = JSON.stringify(arr);
-  const r = spawnSync(SQLITE, [DB, `UPDATE ItemTable SET value = CAST('${sqlLit(json)}' AS TEXT) WHERE key='aicoding.customModels';`], { encoding: 'utf8', timeout: 8000 });
+  const r = spawnSync(SQLITE, [stateDbPath(), `UPDATE ItemTable SET value = CAST('${sqlLit(json)}' AS TEXT) WHERE key='aicoding.customModels';`], { encoding: 'utf8', timeout: 8000 });
   return r.status === 0 ? null : (r.stderr || 'sqlite failed').slice(0, 300);
 }
 
@@ -426,7 +486,7 @@ function writeRecords(arr) {
 function clearByok() {
   const steps = [];
   const run = (sql) => {
-    const r = spawnSync(SQLITE, [DB, sql], { encoding: 'utf8', timeout: 8000 });
+    const r = spawnSync(SQLITE, [stateDbPath(), sql], { encoding: 'utf8', timeout: 8000 });
     return r.status === 0;
   };
   // 1) 清空自定义模型记录
@@ -439,7 +499,7 @@ function clearByok() {
     const key = `chat.modelConfig.${scene}`;
     run(`DELETE FROM ItemTable WHERE key='${sqlLit(key)}';`);
     const ins = spawnSync(SQLITE,
-      [DB, `INSERT OR IGNORE INTO ItemTable(key,value) VALUES('${sqlLit(key)}', CAST('${sqlLit(val)}' AS TEXT));`],
+      [stateDbPath(), `INSERT OR IGNORE INTO ItemTable(key,value) VALUES('${sqlLit(key)}', CAST('${sqlLit(val)}' AS TEXT));`],
       { encoding: 'utf8', timeout: 8000 });
     if (ins.status === 0) steps.push(`${scene} -> ${val}`);
   }
@@ -450,7 +510,13 @@ function clearByok() {
 }
 
 function syncRecord() {
-  const r = spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(DIR, '..', 'scripts', 'sync-qoder-model.ps1')], { encoding: 'utf8', timeout: 60000 });
+  // 统一走 Node 版（scripts/sync-model.js）：两个平台都不再依赖 PowerShell。
+  // --id 把配置里的 recordId 传进去 —— 旧版调 ps1 时这个参数没传，
+  // recordId 改过名的话同步的记录 id 和其它逻辑读的 id 会对不上。
+  const cfg0 = loadConfig();
+  const r = spawnSync(process.execPath,
+    [path.join(DIR, '..', 'scripts', 'sync-model.js'), '--id', cfg0.recordId || 'model_mocktest'],
+    { encoding: 'utf8', timeout: 60000 });
   // Manual context-length override: the gateway does not always report max_input_tokens,
   // and the record is the only place Qoder reads it from.
   const cfg = loadConfig();
@@ -487,9 +553,9 @@ function bindScenesToCustom(recordId) {  const key = `custom:${recordId}`;
   const done = [];
   for (const [scene, val] of Object.entries(scenes)) {
     const k = `chat.modelConfig.${scene}`;
-    const del = spawnSync(SQLITE, [DB, `DELETE FROM ItemTable WHERE key='${sqlLit(k)}';`], { encoding: 'utf8', timeout: 8000 });
+    const del = spawnSync(SQLITE, [stateDbPath(), `DELETE FROM ItemTable WHERE key='${sqlLit(k)}';`], { encoding: 'utf8', timeout: 8000 });
     const ins = spawnSync(SQLITE,
-      [DB, `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('${sqlLit(k)}', CAST('${sqlLit(val)}' AS TEXT));`],
+      [stateDbPath(), `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('${sqlLit(k)}', CAST('${sqlLit(val)}' AS TEXT));`],
       { encoding: 'utf8', timeout: 8000 });
     if (del.status === 0 && ins.status === 0) done.push(scene);
   }
@@ -514,7 +580,7 @@ function bindScenesToCustom(recordId) {  const key = `custom:${recordId}`;
 const BIND_SCENES = ['assistant', 'experts'];
 
 function readBindValue(scene) {
-  const r = spawnSync(SQLITE, [DB, `SELECT value FROM ItemTable WHERE key='chat.modelConfig.${sqlLit(scene)}';`],
+  const r = spawnSync(SQLITE, [stateDbPath(), `SELECT value FROM ItemTable WHERE key='chat.modelConfig.${sqlLit(scene)}';`],
     { encoding: 'utf8', timeout: 8000 });
   if (r.status !== 0) return null;          // 查询失败：不知道，别乱动
   return (r.stdout || '').trim();           // '' = 整行不存在
@@ -531,7 +597,7 @@ function repairSceneBindings() {
     if (cur === null || cur !== '') continue;      // 查询失败 或 行还在 → 不动
     const k = `chat.modelConfig.${scene}`;
     const r = spawnSync(SQLITE,
-      [DB, `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('${sqlLit(k)}', CAST('custom:${sqlLit(want)}' AS TEXT));`],
+      [stateDbPath(), `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('${sqlLit(k)}', CAST('custom:${sqlLit(want)}' AS TEXT));`],
       { encoding: 'utf8', timeout: 8000 });
     if (r.status === 0) fixed.push(scene);
   }
@@ -547,7 +613,11 @@ function startProxy() {
 function stopProxy() {
   // Get-Process 没有 CommandLine 属性（取到的是 null），这个 Where 永远筛不出东西，
   // 所以以前点「重启代理」实际一个进程都没停，界面却提示成功。
-  // 改用 Get-CimInstance 取命令行，并用 -like 避开多层反斜杠转义。
+  // Windows 改用 Get-CimInstance 取命令行；macOS 直接 pkill 匹配命令行。
+  if (IS_MAC) {
+    const r = spawnSync('pkill', ['-f', 'qoder-proxy/proxy\\.js'], { encoding: 'utf8', timeout: 15000 });
+    return r.status;
+  }
   const ps = "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
     "Where-Object { $_.CommandLine -like '*qoder-proxy*proxy.js*' } | " +
     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
@@ -557,24 +627,24 @@ function stopProxy() {
 }
 
 function setIdeProxy(port) {
-  const s = readJSON(SETTINGS, {});
+  const s = readJSON(settingsPath(), {});
   // 记一笔"我们期望 IDE 指向哪个端口"，供守卫在被 Qoder 覆盖后恢复。
   const cfg = loadConfig();
   if (port === null || port === 0 || port === '') {
     // Restore factory state: no proxy key at all.
     delete s['http.proxy'];
-    writeJSON(SETTINGS, s);
+    writeJSON(settingsPath(), s);
     if (cfg.ideProxyPort) { delete cfg.ideProxyPort; writeJSON(CONFIG, cfg); }
     return '';
   }
   s['http.proxy'] = `http://127.0.0.1:${port}`;
-  writeJSON(SETTINGS, s);
+  writeJSON(settingsPath(), s);
   if (cfg.ideProxyPort !== Number(port)) { cfg.ideProxyPort = Number(port); writeJSON(CONFIG, cfg); }
   return s['http.proxy'];
 }
 function autoUpdateState() {
-  const s = readJSON(SETTINGS, {});
-  const a = readJSON(APPJSON, {});
+  const s = readJSON(settingsPath(), {});
+  const a = readJSON(appJsonPath(), {});
   return {
     settings: s?.app?.configAdvancedAutoUpdate,
     appjson: a?.config?.advanced?.autoUpdate,
@@ -665,9 +735,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/status') {
       const cfg = loadConfig();
       const [proxyUp] = await Promise.all([portOpen(proxyPort())]);
-      const settings = readJSON(SETTINGS, {});
+      const settings = readJSON(settingsPath(), {});
       return send(200, {
-      cert: certInfo(),
+        platform: process.platform,
+        cert: certInfo(),
         proxy: { running: proxyUp, port: proxyPort() },
         ide: { httpProxy: settings['http.proxy'] || '', autoUpdate: autoUpdateState(), ...ideInfo() },
         patches: patchStatus(),
@@ -731,7 +802,7 @@ const server = http.createServer(async (req, res) => {
       let portNote = '';
       const newPort = Number(cfg.proxyPort || DEFAULT_PROXY_PORT);
       if (newPort !== oldPort && newPort > 0 && newPort < 65536) {
-        const cur = readJSON(SETTINGS, {})['http.proxy'] || '';
+        const cur = readJSON(settingsPath(), {})['http.proxy'] || '';
         const m = /127\.0\.0\.1:(\d+)/.exec(cur);
         if (m && Number(m[1]) === oldPort) {
           setIdeProxy(newPort);
@@ -820,6 +891,23 @@ const server = http.createServer(async (req, res) => {
       return send(200, { ok: true, active: cfg.activeProfile });
     }
 
+    // OpenCode Go 适配的独立设置（Web 控制台「补丁与开关」页）。
+    // enabled=false 停止注入 x-opencode-session / 专属 UA（opencode.ai 会报
+    // 400 MissingSessionID，仅排障用）；sessionId / userAgent 留空用默认。
+    // 写 config.json，proxy.js 每个请求现读，立即生效无需重启。
+    if (url.pathname === '/api/opencode' && req.method === 'POST') {
+      const incoming = await body();
+      if (!incoming || typeof incoming !== 'object') return send(400, { ok: false, error: '无效内容' });
+      const cfg = loadConfig();
+      const oc = Object.assign({}, cfg.opencode || {});
+      if (typeof incoming.enabled === 'boolean') oc.enabled = incoming.enabled;
+      if (typeof incoming.sessionId === 'string') oc.sessionId = incoming.sessionId.trim();
+      if (typeof incoming.userAgent === 'string') oc.userAgent = incoming.userAgent.trim();
+      cfg.opencode = oc;
+      writeJSON(CONFIG, cfg);
+      return send(200, { ok: true, opencode: cfg.opencode });
+    }
+
     // 连通性自测：直接打一次上游（非流式、极小输出）
     if (url.pathname === '/api/test' && req.method === 'POST') {
       const cfg = loadConfig();
@@ -828,9 +916,22 @@ const server = http.createServer(async (req, res) => {
       const target = new URL(up.baseUrl.replace(/\/$/, '') + '/chat/completions');
       const t0 = Date.now();
       try {
+        const headers = { 'content-type': 'application/json', authorization: `Bearer ${up.apiKey || ''}` };
+        // OpenCode Go 硬性要求 x-opencode-session（缺了报 400 MissingSessionID），
+        // 与 proxy.js 的注入逻辑保持一致，否则控制台自测对 OpenCode 永远失败。
+        // 同样尊重 config.json 的 opencode 独立设置（enabled=false 时按用户要求不注入）。
+        const host = target.hostname;
+        const oc = cfg.opencode || {};
+        if ((host === 'opencode.ai' || host.endsWith('.opencode.ai')) && oc.enabled !== false) {
+          headers['x-opencode-session'] = String(oc.sessionId || '').trim() || 'ses_qoder_byok_selftest';
+          headers['user-agent'] = String(oc.userAgent || '').trim() || 'qoder-byok-proxy/1.0 (opencode-go)';
+        }
+        if (up.extraHeaders && typeof up.extraHeaders === 'object') {
+          for (const [k, v] of Object.entries(up.extraHeaders)) headers[String(k)] = String(v);
+        }
         const res = await fetch(target, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${up.apiKey || ''}` },
+          headers,
           body: JSON.stringify({ model: up.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8 }),
           signal: AbortSignal.timeout(25000),
         });
@@ -873,10 +974,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 弹原生目录选择框，返回用户选中的路径（取消返回 cancelled）
-    // 控制台和 Qoder 跑在同一台机器上，所以由后端开 WinForms 对话框，
+    // 控制台和 Qoder 跑在同一台机器上，所以由后端开系统对话框，
     // 浏览器侧拿不到真实绝对路径，只能这样做。
     if (url.pathname === '/api/pick-folder' && req.method === 'POST') {
       const { initial } = await body().catch(() => ({}));
+      if (IS_MAC) {
+        // osascript 的 choose folder：输出 POSIX 路径（带尾随 / 和换行），
+        // 用户取消时 exit≠0 且 stderr 含 canceled。
+        const start = String(initial || resolveIdeRoot()).replace(/"/g, '\\"');
+        const script = `POSIX path of (choose folder with prompt "选择 Qoder 安装目录（.app 那一层）" default location "${start}")`;
+        const r = spawnSync('osascript', ['-e', script], { encoding: 'utf8', timeout: 300000 });
+        if (r.status === 0 && r.stdout) {
+          return send(200, { ok: true, path: r.stdout.trim().replace(/\/+$/, '') });
+        }
+        if (/canceled|cancelled/i.test(String(r.stderr || ''))) {
+          return send(200, { ok: false, cancelled: true });
+        }
+        return send(200, { ok: false, error: '未能打开目录选择框：' + String(r.stderr || '').trim().split('\n')[0] });
+      }
       const start = String(initial || resolveIdeRoot()).replace(/'/g, "''");
       const script = [
         '$ErrorActionPreference = "SilentlyContinue"',
@@ -907,9 +1022,11 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/cert' && req.method === 'GET') {
     return send(200, certInfo());
   }
-  // 把 ca.crt 装进「当前用户 → 受信任的根证书颁发机构」。
+  // 把 ca.crt 装进系统信任：
+  //   Windows: certutil 装进「当前用户 → 受信任的根证书颁发机构」，弹「安全警告」框
+  //   macOS:   security add-trusted-cert 装进登录钥匙串（用户域，不需要 sudo），弹密码框
   //
-  // 同步执行（spawnSync）：certutil 会弹「安全警告」框等用户点「是」，点完才返回。
+  // 同步执行（spawnSync）：系统会弹确认框等用户点完才返回。
   // 期间控制台的主线程被占住、其它请求排队 —— 这是刻意接受的代价：
   // 一次点击 = 一次完整尝试，结果直接返回，失败就再点一次，没有"后台任务"这种中间状态。
   // （异步版要轮询、要处理残留任务，反而更难重新操作。）
@@ -919,9 +1036,17 @@ const server = http.createServer(async (req, res) => {
     if (before.trusted) return send(200, { ok: true, already: true, trusted: true, cert: before });
 
     const t0 = Date.now();
-    const r = spawnSync('certutil', ['-user', '-addstore', 'Root', before.path], {
-      encoding: 'utf8', windowsHide: false, timeout: 300000,
-    });
+    let r;
+    if (IS_MAC) {
+      r = spawnSync('security', ['add-trusted-cert', '-r', 'trustRoot', '-p', 'ssl',
+        '-k', path.join(os.homedir(), 'Library/Keychains/login.keychain-db'), before.path], {
+        encoding: 'utf8', timeout: 300000,
+      });
+    } else {
+      r = spawnSync('certutil', ['-user', '-addstore', 'Root', before.path], {
+        encoding: 'utf8', windowsHide: false, timeout: 300000,
+      });
+    }
     const after = certInfo(true);
     const seconds = Math.round((Date.now() - t0) / 100) / 10;
     if (after.trusted) return send(200, { ok: true, trusted: true, seconds, cert: after });
@@ -929,7 +1054,7 @@ const server = http.createServer(async (req, res) => {
     const detail = ((r.stderr || '') + (r.stdout || '')).trim().split('\n').slice(-2).join(' ');
     return send(500, {
       ok: false,
-      error: '证书未装上：' + (detail || (r.error ? r.error.message : 'certutil 未返回成功，可能是弹窗里选了「否」')),
+      error: '证书未装上：' + (detail || (r.error ? r.error.message : '命令未返回成功，可能是弹窗里点了「取消」')),
       seconds,
       cert: after,
     });
@@ -976,15 +1101,23 @@ const server = http.createServer(async (req, res) => {
 
     // 全部回滚：恢复 Qoder 原样（原 bundle、原 CSP、无代理、自动更新开），需要 UAC 提权
     if (url.pathname === '/api/revert' && req.method === 'POST') {
-      const script = path.join(DIR, '..', 'revert-all.ps1');
-      if (!fs.existsSync(script)) return send(500, { ok: false, error: 'revert-all.ps1 不存在' });
-      const logFile = path.join(DIR, '..', '_revert_all_log.txt');
-      try { fs.unlinkSync(logFile); } catch { /* ignore */ }
-      // 回滚 = 恢复官方状态。revert-all.ps1 默认保留模型记录，
-      // 那会留下"补丁没了 + 代理没了，但自定义模型还在"的坏状态（选中发不出去）。
+      // 回滚 = 恢复官方状态。默认保留模型记录的话，
+      // 会留下"补丁没了 + 代理没了，但自定义模型还在"的坏状态（选中发不出去）。
       // 所以发起回滚前先清 BYOK。
       let byok = [];
       try { byok = clearByok(); } catch (e) { byok = ['清理 BYOK 失败：' + e.message]; }
+      const logFile = path.join(DIR, '..', '_revert_all_log.txt');
+      try { fs.unlinkSync(logFile); } catch { /* ignore */ }
+      if (IS_MAC) {
+        // 免提权：revert-patches.js 自己处理"先摘守卫依据再停代理"的顺序
+        const child = spawn(process.execPath,
+          [path.join(DIR, '..', 'scripts', 'revert-patches.js'), '--root', resolveIdeRoot(), '--keep-model-record'],
+          { detached: true, stdio: 'ignore' });
+        child.unref();
+        return send(200, { ok: true, started: true, note: '回滚已在后台执行；完成后重启 Qoder IDE。' });
+      }
+      const script = path.join(DIR, '..', 'revert-all.ps1');
+      if (!fs.existsSync(script)) return send(500, { ok: false, error: 'revert-all.ps1 不存在' });
       const args = ['-NoProfile', '-Command',
         `Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','${script.replace(/'/g, "''")}','-Root','"${resolveIdeRoot().replace(/"/g, '""')}"'`];
       // 同 /api/apply：必须等启动器跑完，否则提权进程不会真正拉起
@@ -1001,12 +1134,20 @@ const server = http.createServer(async (req, res) => {
       return send(200, { ok: true, lines, done: lines.some((l) => l.includes('REVERT-ALL DONE')) });
     }
 
-    // 应用全部补丁（重装/升级 Qoder 后使用），需要 UAC 提权
+    // 应用全部补丁（重装/升级 Qoder 后使用）
     if (url.pathname === '/api/apply' && req.method === 'POST') {
-      const script = path.join(DIR, '..', 'apply-all.ps1');
-      if (!fs.existsSync(script)) return send(500, { ok: false, error: 'apply-all.ps1 不存在' });
       const applyLog = path.join(DIR, '..', '_apply_all_log.txt');
       try { fs.unlinkSync(applyLog); } catch { /* ignore */ }
+      if (IS_MAC) {
+        // 免提权：app 目录属于当前用户。后台跑，进度靠 /api/apply-status 轮询日志。
+        const child = spawn(process.execPath,
+          [path.join(DIR, '..', 'scripts', 'apply-patches.js'), '--root', resolveIdeRoot()],
+          { detached: true, stdio: 'ignore' });
+        child.unref();
+        return send(200, { ok: true, started: true, note: '补丁已在后台应用（会先关闭 Qoder IDE）；完成后重启 Qoder IDE。' });
+      }
+      const script = path.join(DIR, '..', 'apply-all.ps1');
+      if (!fs.existsSync(script)) return send(500, { ok: false, error: 'apply-all.ps1 不存在' });
       // 必须等这个「启动器」powershell 跑完，提权进程才真的会被拉起来。
       // 以前用 spawn(detached + stdio:'ignore') 发完就 unref，结果提权命令
       // 根本没有执行 —— 界面上点「应用补丁」永远没反应，也不报错。
@@ -1175,7 +1316,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Qoder BYOK console: http://127.0.0.1:${PORT}`);
-  // 启动时把安装目录探明一次（要 spawn PowerShell，约 200ms）。
+  // 启动时把安装目录探明一次（要 spawn 一次外部进程，约 200ms）。
   // 放在这里而不是 /api/status 里，避免每次轮询都把单线程服务卡住。
   try {
     const r = resolveIdeRoot(true);
@@ -1187,7 +1328,7 @@ server.listen(PORT, '127.0.0.1', () => {
 // reboot), bring it back so the IDE does not sit there with no network.
 setInterval(async () => {
   try {
-    const s = readJSON(SETTINGS, {});
+    const s = readJSON(settingsPath(), {});
     const proxy = String(s['http.proxy'] || '');
     if (!proxy.includes(`:${proxyPort()}`)) return;
     if (await portOpen(proxyPort())) return;
@@ -1217,9 +1358,9 @@ setInterval(() => {
   try {
     const want = Number(loadConfig().ideProxyPort || 0);
     if (!want) return;
-    const cur = String(readJSON(SETTINGS, {})['http.proxy'] || '');
+    const cur = String(readJSON(settingsPath(), {})['http.proxy'] || '');
     if (cur === `http://127.0.0.1:${want}`) return;
-    writeJSON(SETTINGS, Object.assign(readJSON(SETTINGS, {}), { 'http.proxy': `http://127.0.0.1:${want}` }));
+    writeJSON(SETTINGS, Object.assign(readJSON(settingsPath(), {}), { 'http.proxy': `http://127.0.0.1:${want}` }));
     console.log(`[ide-proxy-guard] http.proxy was "${cur}", restored to :${want}`);
   } catch { /* 文件被占用，下轮再试 */ }
 }, 30000);

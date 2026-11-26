@@ -130,6 +130,11 @@ export const setTools = (injectTools) =>
 export const updateConfig = (data) =>
   request('/api/config', { method: 'POST', body: data });
 
+// ==================== OpenCode ====================
+/** OpenCode Go 适配的独立设置：{ enabled, sessionId, userAgent }，写后立即生效 */
+export const setOpencode = (data) =>
+  request('/api/opencode', { method: 'POST', body: data });
+
 export const exportConfig = () => request('/api/export');
 
 export const importConfig = (data) =>

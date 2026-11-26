@@ -34,17 +34,25 @@ foreach ($f in $htmlFiles) {
   Log "$(Split-Path $f -Leaf): CSP patched"
 }
 
-# 2) Renderer: poll /state and refresh the custom model display name
+# 2) Renderer: poll /state and hot-sync all model capability fields (v2).
+#    v1 only synced displayName; v2 also syncs is_vl/is_reasoning/max tokens/thinkingConfig.
 $anchor = 'this._registerGetCustomModelsHandler()}'
-$poller = 'this._registerGetCustomModelsHandler();const _lm=this;setInterval(async()=>{try{const _r=await fetch("http://127.0.0.1:8788/state");const _j=await _r.json();if(!_j||!_j.displayName)return;const _m=_lm._models.find(x=>x.id===(_j.recordId||"model_mocktest"));if(_m&&_m.displayName!==_j.displayName){_m.displayName=_j.displayName;_lm._storeModels(!1);_lm._onDidChangeModels.fire(_lm.getModels())}}catch{}},3000)}'
+$pollerV1 = 'this._registerGetCustomModelsHandler();const _lm=this;setInterval(async()=>{try{const _r=await fetch("http://127.0.0.1:8788/state");const _j=await _r.json();if(!_j||!_j.displayName)return;const _m=_lm._models.find(x=>x.id===(_j.recordId||"model_mocktest"));if(_m&&_m.displayName!==_j.displayName){_m.displayName=_j.displayName;_lm._storeModels(!1);_lm._onDidChangeModels.fire(_lm.getModels())}}catch{}},3000)}'
+$poller = 'this._registerGetCustomModelsHandler();const _lm=this;setInterval(async()=>{try{const _r=await fetch("http://127.0.0.1:8788/state");const _j=await _r.json();if(!_j)return;const _m=_lm._models&&_lm._models.find(x=>x.id===(_j.recordId||"model_mocktest"));if(!_m)return;const _cur=JSON.stringify([_m.displayName,_m.is_vl,_m.is_reasoning,_m.max_input_tokens,_m.max_output_tokens,_m.thinkingConfig]);const _nw=JSON.stringify([_j.displayName,_j.is_vl,_j.is_reasoning,_j.max_input_tokens,_j.max_output_tokens,_j.thinkingConfig]);if(_cur!==_nw){_m.displayName=_j.displayName;_m.is_vl=_j.is_vl;_m.is_reasoning=_j.is_reasoning;_m.max_input_tokens=_j.max_input_tokens;_m.max_output_tokens=_j.max_output_tokens;_m.thinkingConfig=_j.thinkingConfig;_lm._storeModels(!1);_lm._onDidChangeModels.fire(_lm.getModels())}}catch{}},3000)}'
 foreach ($f in $jsFiles) {
   $t = [System.IO.File]::ReadAllText($f)
-  if ($t -match '_lm=this;setInterval') { Log "$(Split-Path $f -Leaf): poller already present"; continue }
+  if ($t.Contains('_cur=JSON.stringify([_m.displayName')) { Log "$(Split-Path $f -Leaf): poller v2 already present"; continue }
+  if ($t.Contains($pollerV1)) {
+    $t = $t.Replace($pollerV1, $poller)
+    [System.IO.File]::WriteAllText($f, $t, (New-Object System.Text.UTF8Encoding($false)))
+    Log "$(Split-Path $f -Leaf): poller upgraded v1 -> v2"
+    continue
+  }
   $hits = ([regex]::Matches($t, [regex]::Escape($anchor))).Count
   if ($hits -ne 1) { throw "poller anchor count $hits in $f" }
   $t = $t.Replace($anchor, $poller)
   [System.IO.File]::WriteAllText($f, $t, (New-Object System.Text.UTF8Encoding($false)))
-  Log "$(Split-Path $f -Leaf): poller patched"
+  Log "$(Split-Path $f -Leaf): poller patched (v2)"
 }
 
 # 3) Refresh checksums

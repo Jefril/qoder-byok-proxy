@@ -112,7 +112,7 @@ export default {
         <div class="mt-4 p-3" style="background:var(--surface-2);border-radius:var(--radius-md)">
           <div class="text-sm" style="margin-bottom:8px">
             <strong>代理证书未被信任</strong>：Qoder 会因证书校验失败连不上本代理。
-            点下面按钮，Windows 会弹一次安全警告，选「是」即可（不需要管理员）。
+            点下面按钮，${state.isMac ? '系统会弹一次钥匙串确认（输入登录密码）' : 'Windows 会弹一次安全警告，选「是」即可（不需要管理员）'}。
           </div>
           <button class="btn btn--primary" data-mt="trust-cert">信任证书</button>
         </div>`}
@@ -202,9 +202,9 @@ export default {
           await actions.loadStatus();
           toast.success('已重置引导标记，「状态概览」会重新显示引导卡');
         } else if (act === 'trust-cert') {
-          // 同步等待：弹窗里点完「是」请求才返回，期间按钮保持禁用并显示等待状态。
+          // 同步等待：系统弹窗里确认完请求才返回，期间按钮保持禁用并显示等待状态。
           // 失败就再点一次，不保留任何中间状态。
-          lock('等待确认…（请在弹窗点「是」）');
+          lock(state.isMac ? '等待确认…（输入登录密码以信任证书）' : '等待确认…（请在弹窗点「是」）');
           try {
             const r = await api.trustCert();
             await actions.loadStatus();

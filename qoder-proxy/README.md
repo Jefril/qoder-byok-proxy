@@ -14,9 +14,12 @@ Qoder IDE ──http.proxy──> 127.0.0.1:8788 (本代理)
                               │
                               └─ 其他请求 → 原样隧道到 api3.qoder.sh
 
-出站方向默认直连；如果外网需要经上游代理转发（例如换号器），
-在环境变量 UPSTREAM_PROXY 或 config.upstreamProxy 里填地址即可，
-不填就是直连。源码顶部注释里写的 9940 只是作者本机的示例值。
+出站方向（到上游 + 回官方网关的隧道）默认 auto：每 30 秒探测本地
+Clash 系端口（7897/7890/7891/1080），开着 Clash 就走它，没开直连；
+Clash 中途被关会在请求失败时立即降级直连（60 秒后重新探测）。
+想显式控制，在环境变量 UPSTREAM_PROXY 或 config.upstreamProxy 里填：
+`"auto"`/空 = 自动探测（默认）、`"direct"` = 强制直连、`"127.0.0.1:9940"` = 固定代理。
+源码顶部注释里写的 9940 只是作者本机的示例值。
 ```
 
 ## 配置 `config.json`
@@ -596,7 +599,6 @@ qoder-byok/
    ├─ proxy.js               MITM 代理（8788）：解包 → 转发网关 → 包回 SSE 信封
    ├─ admin.js               控制台后端（3426）：27 个端点 + 三个自愈守卫
    ├─ certs.js               证书自举：缺失时用 openssl 现场生成 CA + 签证书
-   ├─ admin.html             控制台外壳
    ├─ index.html             入口页
    ├─ config.json            运行时配置（含明文 apiKey → 不入库）
    ├─ config.example.json    可复制的配置模板（全部字段 + 占位符，入库）

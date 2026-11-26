@@ -26,11 +26,13 @@ export default {
 
       <div id="set-ide" class="mb-5"></div>
       <div id="set-switches" class="mb-5"></div>
+      <div id="set-opencode" class="mb-5"></div>
       <div id="set-global"></div>
     `;
 
     this.renderIde();
     this.renderSwitches();
+    this.renderOpencode();
     this.renderGlobal();
     this.setupSubscriptions();
   },
@@ -42,6 +44,7 @@ export default {
       subscribe('status', () => {
         this.renderIde();
         this.renderSwitches();
+        this.renderOpencode();
         this.renderGlobal();
       })
     );
@@ -120,6 +123,7 @@ export default {
 
     const injectTools = st.config?.injectTools !== false;
     const serveWiki = st.config?.serveWiki !== false;
+    const opencodeEnabled = st.config?.opencode?.enabled !== false;
 
     el.innerHTML = Card({
       title: '功能开关',
@@ -151,6 +155,64 @@ export default {
               <div class="switch__track"><div class="switch__thumb"></div></div>
             </label>
           </div>
+
+          <hr class="divider" style="margin:0">
+
+          <div class="flex items-start justify-between gap-4">
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:var(--weight-semibold)">OpenCode 适配</div>
+              <div class="text-xs text-muted mt-1">上游是 opencode.ai 时自动注入 x-opencode-session 与专属 UA（它的硬性要求）。关掉后 opencode.ai 会拒绝请求，仅排障用</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" class="switch__input" data-set="opencodeEnabled" ${opencodeEnabled ? 'checked' : ''}>
+              <div class="switch__track"><div class="switch__thumb"></div></div>
+            </label>
+          </div>
+        </div>
+      `,
+    });
+  },
+
+  /* ---------- OpenCode Go 适配（仅对 baseUrl 为 opencode.ai 的上游生效） ---------- */
+  renderOpencode() {
+    const el = document.getElementById('set-opencode');
+    if (!el) return;
+
+    const cfg = state.status?.config;
+    if (!cfg) {
+      el.innerHTML = Card({ title: 'OpenCode 适配', icon: Icon.sliders, iconVariant: 'accent', children: '<div class="skeleton skeleton--text" style="width:100%"></div>' });
+      return;
+    }
+
+    const oc = cfg.opencode || {};
+
+    el.innerHTML = Card({
+      title: 'OpenCode 适配',
+      subtitle: '仅对 baseUrl 为 opencode.ai 的上游生效，保存后立即生效',
+      icon: Icon.sliders,
+      iconVariant: 'accent',
+      children: `
+        <form id="set-opencode-form" class="form-grid form-grid--2">
+          ${Field({
+            label: 'x-opencode-session',
+            name: 'ocSessionId',
+            value: oc.sessionId || '',
+            placeholder: '留空 = 自动生成稳定会话 ID',
+            hint: 'opencode.ai 硬性要求每个请求带稳定的会话 ID；固定它可提升提示词缓存命中，且不随代理重启失效',
+          })}
+          ${Field({
+            label: 'User-Agent',
+            name: 'ocUserAgent',
+            value: oc.userAgent || '',
+            placeholder: '留空 = qoder-byok-proxy/1.0 (opencode-go)',
+            hint: '建议用专属 UA 而不是通用 HTTP 库名',
+          })}
+        </form>
+      `,
+      footer: `
+        <div class="btn-group btn-group--end">
+          <button class="btn btn--ghost" data-oc-act="reload">重新读取</button>
+          <button class="btn btn--primary" data-oc-act="save">${Icon.save}<span>保存</span></button>
         </div>
       `,
     });
@@ -220,6 +282,9 @@ export default {
         } else if (which === 'serveWiki') {
           await api.updateConfig({ serveWiki: on });
           toast.success(`Wiki 用自定义模型已${on ? '开启' : '关闭'}`);
+        } else if (which === 'opencodeEnabled') {
+          await api.setOpencode({ enabled: on });
+          toast.success(`OpenCode 适配已${on ? '开启' : '关闭'}`);
         }
         await actions.loadStatus();
       } catch (err) {
@@ -290,6 +355,46 @@ export default {
       } finally {
         btn.disabled = false;
         btn.innerHTML = orig;
+      }
+    });
+
+    // OpenCode 适配：重新读取 / 保存
+    this.on(document, 'click', async (e) => {
+      const btn = e.target.closest('[data-oc-act]');
+      if (!btn) return;
+      if (!document.getElementById('set-opencode')) return;
+
+      const act = btn.dataset.ocAct;
+
+      if (act === 'reload') {
+        await actions.loadStatus();
+        toast.success('已重新读取');
+        return;
+      }
+
+      if (act === 'save') {
+        const form = document.getElementById('set-opencode-form');
+        if (!form) return;
+
+        const fd = new FormData(form);
+        const payload = {
+          sessionId: String(fd.get('ocSessionId') || '').trim(),
+          userAgent: String(fd.get('ocUserAgent') || '').trim(),
+        };
+
+        const orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '保存中…';
+        try {
+          await api.setOpencode(payload);
+          await actions.loadStatus();
+          toast.success('OpenCode 设置已保存，下次请求生效');
+        } catch (err) {
+          toast.error(err.message || '保存失败');
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = orig;
+        }
       }
     });
 

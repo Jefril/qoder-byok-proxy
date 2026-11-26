@@ -9,9 +9,10 @@
     powershell -ExecutionPolicy Bypass -File start.ps1 -Stop
     powershell -ExecutionPolicy Bypass -File start.ps1 -Open      # 启动后打开控制台
 
-  它只负责起两个后台服务，不改 Qoder 的任何配置：
-    控制台  admin.js   http://127.0.0.1:3426
-    代理    proxy.js   127.0.0.1:8788
+  它只负责起三个后台服务，不改 Qoder 的任何配置：
+    控制台        admin.js              http://127.0.0.1:3426
+    代理          proxy.js              127.0.0.1:8788  （IDE 用，MITM 私有协议）
+    OpenCode代理  opencode-go-proxy.mjs 127.0.0.1:8787  （Desktop 用，注入 x-opencode-session）
 
   注意：本文件是带 BOM 的 UTF-8，这样 PowerShell 5.1 才能正确读中文。
 #>
@@ -29,7 +30,8 @@ $LogDir = Join-Path $Root '_start_logs'
 
 $Services = @(
   [pscustomobject]@{ Name = '控制台'; File = 'admin.js'; Port = 3426; Url = 'http://127.0.0.1:3426/' },
-  [pscustomobject]@{ Name = '代理';   File = 'proxy.js'; Port = 8788; Url = $null }
+  [pscustomobject]@{ Name = '代理';   File = 'proxy.js'; Port = 8788; Url = $null },
+  [pscustomobject]@{ Name = 'OpenCode代理'; File = 'opencode-go-proxy.mjs'; Port = 8787; Url = $null }
 )
 
 function Test-Port([int]$Port) {
@@ -90,6 +92,11 @@ function Start-All {
     exit 1
   }
   if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+  # 干净出网：剥掉启动终端可能带的环境代理，服务全部直连上游，与启动环境无关（跨设备一致）
+  foreach ($v in 'http_proxy','https_proxy','all_proxy','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NODE_USE_ENV_PROXY','UPSTREAM_PROXY') {
+    Remove-Item -Path ('Env:' + $v) -ErrorAction SilentlyContinue
+  }
 
   Write-Host ''
   Write-Host '启动 Qoder BYOK 服务' -ForegroundColor Cyan

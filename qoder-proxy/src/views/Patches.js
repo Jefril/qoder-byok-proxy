@@ -91,7 +91,7 @@ export default {
             <div style="flex:1;min-width:0">
               <div style="font-weight:var(--weight-semibold);margin-bottom:6px">有 ${dirty.length} 项变更还没写进 Qoder</div>
               ${lines}
-              <div class="text-xs text-muted mt-2">点右侧「应用补丁」才会真正生效（会关闭 Qoder 并请求管理员权限）。</div>
+              <div class="text-xs text-muted mt-2">点右侧「应用补丁」才会真正生效（会关闭 Qoder${state.isMac ? '' : ' 并请求管理员权限'}）。</div>
             </div>
           </div>
         </div>
@@ -210,7 +210,7 @@ export default {
 
     el.innerHTML = Card({
       title: '写入 Qoder',
-      subtitle: '会关闭 Qoder、覆盖 bundle、请求管理员权限',
+      subtitle: `会关闭 Qoder、覆盖 bundle${state.isMac ? '' : '、请求管理员权限'}`,
       icon: Icon.play,
       iconVariant: 'accent',
       children: `
@@ -287,7 +287,7 @@ export default {
       const orig = btn.innerHTML;
 
       if (act === 'apply') {
-        if (!confirm('应用补丁会关闭 Qoder、覆盖 bundle，需要管理员权限。\n\n继续？')) return;
+        if (!confirm(`应用补丁会关闭 Qoder、覆盖 bundle${state.isMac ? '' : '，需要管理员权限'}。\n\n继续？`)) return;
         btn.disabled = true;
         btn.innerHTML = '应用中…';
         try {

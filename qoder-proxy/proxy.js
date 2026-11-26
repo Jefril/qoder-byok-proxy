@@ -9,10 +9,13 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 const { StringDecoder } = require('string_decoder');
+const { randomUUID } = require('crypto');
 const tls = require('tls');
 const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
+const Q = require('../scripts/qoder-paths');
 
 // Port precedence: env > config.json proxyPort > 8788
 // NOTE: uses __dirname directly because CONFIG_PATH is declared further down
@@ -26,21 +29,85 @@ function resolvePort() {
   return 8788;
 }
 const PORT = resolvePort();
-// Optional chaining proxy (e.g. the account switcher on 9940). Empty = connect direct.
-// Precedence: env UPSTREAM_PROXY > config.upstreamProxy > none.
-const UPSTREAM_PROXY = (() => {
+// Optional chaining proxy (e.g. the account switcher on 9940).
+// Precedence: env UPSTREAM_PROXY > config.json upstreamProxy.
+// config 值语义（跨设备通用，零配置迁移）：
+//   "" / "auto" / 缺省 → 自动探测本地 Clash 系端口（7897/7890/7891/1080）：
+//                        开着 Clash 就走 Clash，没开直连；Clash 中途被关会在
+//                        请求失败时立即降级直连（60s 冷却后再重新探测）。
+//   "direct"            → 强制直连，不探测。
+//   "host:port"         → 固定走指定代理（原语义）。
+const UPSTREAM_PROXY_RAW = (() => {
   let raw = process.env.UPSTREAM_PROXY;
   if (!raw) {
-    try { raw = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8')).upstreamProxy || ''; } catch { /* ignore */ }
+    try { raw = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8')).upstreamProxy; } catch { /* ignore */ }
   }
-  if (!raw) return null;
-  const [h, p] = String(raw).split(':');
+  return String(raw == null ? '' : raw).trim();
+})();
+const UPSTREAM_PROXY_FIXED = (() => {
+  const raw = UPSTREAM_PROXY_RAW;
+  if (!raw || raw === 'auto' || raw === 'direct') return null;
+  const [h, p] = raw.split(':');
   return { host: h || '127.0.0.1', port: Number(p || 80) };
 })();
+const UPSTREAM_PROXY_FORCED_DIRECT = UPSTREAM_PROXY_RAW === 'direct';
+// 动态出站代理：fixed 恒定；auto 模式下由探测刷新（探测回调异步执行，此时 log/LOG 均已就绪）
+let UPSTREAM_PROXY = UPSTREAM_PROXY_FIXED;
+let proxyCooldownUntil = 0;
+const CLASH_PROBE_PORTS = [7897, 7890, 7891, 1080];
+function probeLocalProxy(cb) {
+  let i = 0;
+  const next = () => {
+    if (i >= CLASH_PROBE_PORTS.length) return cb(null);
+    const port = CLASH_PROBE_PORTS[i++];
+    const s = net.connect({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      if (ok) cb({ host: '127.0.0.1', port }); else next();
+    };
+    s.once('connect', () => finish(true));
+    s.once('error', () => finish(false));
+    const t = setTimeout(() => finish(false), 600);
+    if (t.unref) t.unref();
+  };
+  next();
+}
+function refreshOutboundProxy() {
+  if (UPSTREAM_PROXY_FIXED || UPSTREAM_PROXY_FORCED_DIRECT) return;
+  if (Date.now() < proxyCooldownUntil) return;
+  probeLocalProxy((found) => {
+    const prev = UPSTREAM_PROXY ? `${UPSTREAM_PROXY.host}:${UPSTREAM_PROXY.port}` : 'direct';
+    const now = found ? `${found.host}:${found.port}` : 'direct';
+    UPSTREAM_PROXY = found;
+    if (prev !== now) log({ kind: 'outbound-proxy', from: prev, to: now });
+  });
+}
+refreshOutboundProxy();
+setInterval(refreshOutboundProxy, 30000).unref();
+// 代理失联时调用：立即降级直连 + 60s 冷却，避免探测在抖动期间来回切换
+function dropOutboundProxy(reason) {
+  if (!UPSTREAM_PROXY) return;
+  log({ kind: 'outbound-proxy-down', host: UPSTREAM_PROXY.host, port: UPSTREAM_PROXY.port, reason });
+  proxyCooldownUntil = Date.now() + 60000;
+  UPSTREAM_PROXY = null;
+}
 const MITM_HOSTS = new Set(
   (process.env.MITM_HOSTS || 'api3.qoder.sh,center.qoder.sh,openapi.qoder.sh,api2.qoder.sh,api1.qoder.sh')
     .split(',').map((s) => s.trim()).filter(Boolean)
 );
+// CN 版后端域名与国际版不同（Desktop 隧道转发的目标不是 api3 的 GA IP），
+// config.json 的 mitmHosts 数组可与默认名单合并；热更新：每次 CONNECT 都读最新配置。
+function mitmHostsNow() {
+  const set = new Set(MITM_HOSTS);
+  try {
+    const extra = loadConfig().mitmHosts;
+    if (Array.isArray(extra)) for (const h of extra) if (h) set.add(String(h).toLowerCase());
+  } catch { /* ignore */ }
+  return set;
+}
 const DIR = __dirname;
 const LOG = path.join(DIR, 'proxy.log');
 const BODY_DIR = path.join(DIR, 'bodies');
@@ -50,29 +117,46 @@ fs.mkdirSync(BODY_DIR, { recursive: true });
 // 心跳/APM/遥测每 15 秒一条，两天攒到 2 万多个文件、360MB。
 const KEEP_BODY = /agent_chat_generation|codec|wiki|codebase\/file\/upload/i;
 const BODY_TTL_MS = 24 * 60 * 60 * 1000;
+// 总量兜底：TTL 只在启动后清一次的话长期运行照样无限涨（实测两天 271MB），
+// 所以除 TTL 外再给目录一个总大小上限，超了从最旧开始删。
+const BODY_MAX_BYTES = 50 * 1024 * 1024;
+const BODY_PRUNE_INTERVAL_MS = 30 * 60 * 1000;
 
-// 启动后异步清一次过期快照（不阻塞监听）
 function pruneBodies() {
   let removed = 0;
   let bytes = 0;
   try {
     const now = Date.now();
+    const kept = [];
     for (const f of fs.readdirSync(BODY_DIR)) {
       const fp = path.join(BODY_DIR, f);
       try {
         const st = fs.statSync(fp);
-        if (st.isFile() && now - st.mtimeMs > BODY_TTL_MS) {
+        if (!st.isFile()) continue;
+        if (now - st.mtimeMs > BODY_TTL_MS) {
           bytes += st.size;
           fs.unlinkSync(fp);
           removed++;
+        } else {
+          kept.push({ fp, mtime: st.mtimeMs, size: st.size });
         }
       } catch { /* 跳过正在写的文件 */ }
+    }
+    let total = kept.reduce((a, x) => a + x.size, 0);
+    if (total > BODY_MAX_BYTES) {
+      kept.sort((a, b) => a.mtime - b.mtime);
+      for (const x of kept) {
+        if (total <= BODY_MAX_BYTES) break;
+        try { fs.unlinkSync(x.fp); total -= x.size; bytes += x.size; removed++; } catch { /* 正在被写 */ }
+      }
     }
   } catch { /* 目录不存在就算了 */ }
   if (removed) log({ kind: 'bodies-pruned', removed, mb: Math.round(bytes / 1048576) });
   return removed;
 }
+// 启动后 5 秒先清一次，之后每 30 分钟再清，长期运行也不会无限增长
 setTimeout(pruneBodies, 5000);
+setInterval(pruneBodies, BODY_PRUNE_INTERVAL_MS).unref();
 
 // 证书：新克隆的仓库里没有私钥，缺了就现场生成一套（见 certs.js）
 const certStatus = require('./certs').ensureCerts(DIR);
@@ -83,8 +167,12 @@ if (!certStatus.ok) {
 if (certStatus.created) {
   console.log('certificates generated: ' + path.join(DIR, 'ca.crt'));
   console.log('  → 首次使用要让系统信任这张 CA，否则 Qoder 会因证书校验失败连不上本代理。');
-  console.log('     在控制台「维护 → 环境状态」点「信任证书」即可（只需在 Windows 弹窗点「是」）。');
-  console.log('     等价的命令行：certutil -user -addstore Root "' + path.join(DIR, 'ca.crt') + '"');
+  console.log('     在控制台「维护 → 环境状态」点「信任证书」即可（系统弹窗里确认一次）。');
+  if (process.platform === 'darwin') {
+    console.log('     等价的命令行：security add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db "' + path.join(DIR, 'ca.crt') + '"');
+  } else {
+    console.log('     等价的命令行：certutil -user -addstore Root "' + path.join(DIR, 'ca.crt') + '"');
+  }
 }
 
 const key = fs.readFileSync(path.join(DIR, 'leaf.key'));
@@ -105,6 +193,38 @@ function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return CONFIG; }
 }
 CONFIG = loadConfig();
+
+// ---- 模型记录读取（/state 用，供 IDE 轮询热同步能力字段）----
+// sqlite 记录是唯一真相（sync-model.js / 控制台写入）。mtime 缓存：
+// IDE 每 3s 轮询一次 /state，库文件没变就零开销，变了才 spawnSync 一次。
+let _recCache = { mtimeMs: -1, value: null };
+function stateDbPath() {
+  const cfg = loadConfig();
+  const root = (cfg && cfg.ideRoot && Q.looksLikeIdeRoot(cfg.ideRoot))
+    ? cfg.ideRoot
+    : (Q.IS_MAC ? '/Applications/Qoder CN IDE.app' : 'D:\\Qoder IDE');
+  const app = Q.appDirOf(root);
+  if (!app) return '';
+  return path.join(Q.userDataDir(app), 'User', 'globalStorage', 'state.vscdb');
+}
+function readModelRecord() {
+  const db = stateDbPath();
+  if (!db) return null;
+  let mtimeMs = -1;
+  try { mtimeMs = fs.statSync(db).mtimeMs; } catch { return null; }
+  if (mtimeMs === _recCache.mtimeMs) return _recCache.value;
+  let value = null;
+  try {
+    const r = spawnSync(process.env.SQLITE3 || 'sqlite3',
+      [db, "SELECT value FROM ItemTable WHERE key='aicoding.customModels';"],
+      { encoding: 'utf8', timeout: 8000 });
+    const v = (r.stdout || '').trim();
+    const a = v ? JSON.parse(v) : null;
+    if (Array.isArray(a)) value = a;
+  } catch { /* 记录缺失/损坏时返回 null，轮询侧照常工作 */ }
+  _recCache = { mtimeMs, value };
+  return value;
+}
 
 // Extra tool definitions injected when Qoder's own tool list is missing them
 // (Qoder only hands out read tools on planning turns). Reloaded on file change.
@@ -519,6 +639,40 @@ function upstreamToken(key) {
   return k;
 }
 
+// ---- OpenCode Go 支持 ------------------------------------------------
+// OpenCode Go（opencode.ai/inference/go）硬性要求每个推理请求携带稳定的
+// x-opencode-session 头（400 MissingSessionID），并建议客户端用专属 UA
+// 而不是通用 HTTP 库名。代理层拿不到 Qoder 的会话概念，所以用进程级稳定 ID
+// 折中：同一进程内所有请求共用一个 ID；重启代理会换新，只影响提示词缓存
+// 命中，不影响功能。显式指定用环境变量 OPENCODE_SESSION_ID。
+const OPENCODE_SESSION = process.env.OPENCODE_SESSION_ID
+  || ('ses_qoder_byok_' + randomUUID());
+
+function isOpenCodeUpstream(up) {
+  try {
+    const h = new URL(up.baseUrl).hostname;
+    return h === 'opencode.ai' || h.endsWith('.opencode.ai');
+  } catch { return false; }
+}
+
+// OpenCode 上游的附加请求头。放在默认头之后、通用 extraHeaders 之前合并，
+// extraHeaders 里的显式配置仍可覆盖这里的一切。
+// 独立设置（config.json 的 opencode 字段，Web 控制台「补丁与开关」页可改）：
+//   enabled=false  关掉注入（opencode.ai 会报 400 MissingSessionID，仅排障用）
+//   sessionId      非空则替代进程级默认 ID（想固定会话/提示词缓存命中时用）
+//   userAgent      非空则替代默认 UA
+// 三项都留空/缺省 = 与旧版行为完全一致。
+function opencodeExtraHeaders(up, cfg) {
+  if (!isOpenCodeUpstream(up)) return {};
+  const oc = (cfg && cfg.opencode) || {};
+  if (oc.enabled === false) return {};
+  return {
+    'x-opencode-session': String(oc.sessionId || '').trim() || OPENCODE_SESSION,
+    'user-agent': String(oc.userAgent || '').trim() || 'qoder-byok-proxy/1.0 (opencode-go)',
+  };
+}
+// -----------------------------------------------------------------------
+
 function serveCustomModel(req, res, decodedText, cfg, rawBody) {
   const up = (cfg && cfg.upstream) || CONFIG.upstream;
   // 按请求隔离采样（wiki 会并发发多个请求，用全局会串扰）
@@ -617,10 +771,24 @@ function serveCustomModel(req, res, decodedText, cfg, rawBody) {
   });
   const target = new URL(up.baseUrl.replace(/\/$/, '') + '/chat/completions');
   const transport = target.protocol === 'http:' ? http : https;
-  const upstreamReq = transport.request({
+  // 直连上游偶发网络抖动（国内到 Cloudflare 的连接重置；实测 error.message 可能为空，
+  // 形似 autoSelectFamily 汇总的 AggregateError，错误详情要看 e.errors）。瞬时错误且
+  // 尚未收到响应头时自动重发，最多 3 次；一旦开始回传响应（流式）绝不重试，避免重复输出。
+  const MAX_UPSTREAM_ATTEMPTS = 3;
+  const isTransientUpstreamError = (e) => {
+    const s = String(e && e.message) + ' ' + String(e && e.code) + ' ' + String(e && e.name);
+    if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|socket hang up|AggregateError/i.test(s)) return true;
+    return Array.isArray(e && e.errors) && e.errors.length > 0;
+  };
+  const upstreamReqOpts = {
     host: target.hostname, port: target.port || (target.protocol === 'http:' ? 80 : 443),
     path: target.pathname + target.search,
     method: 'POST',
+    // 关键：挂上 UpstreamAgent，聊天请求才会跟着 auto 探测的出站通道走
+    // （Clash 开着走 Clash CONNECT 隧道，没开直连 + 瞬时错误重试）。
+    // 原实现漏了这一行，上游请求恒走默认 globalAgent 直连，
+    // upstreamProxy 配了也不生效——直连 opencode.ai 不通的时段 IDE 必失败。
+    agent,
     headers: {
       'content-type': 'application/json',
       authorization: 'Bearer ' + upstreamToken(up.apiKey),
@@ -641,8 +809,17 @@ function serveCustomModel(req, res, decodedText, cfg, rawBody) {
       'x-qoder-proxy': 'byok',
       ...(req.headers['cosy-version'] ? { 'x-qoder-version': String(req.headers['cosy-version']) } : {}),
       ...(req.headers['x-request-id'] ? { 'x-request-id': String(req.headers['x-request-id']) } : {}),
+      // OpenCode Go 需要 x-opencode-session + 专属 UA（覆盖上面的默认 UA）
+      ...opencodeExtraHeaders(up, cfg),
+      // 通用自定义头：config.json upstream.extraHeaders 里的键值对原样合并，
+      // 优先级最高，可覆盖上面的一切（给任意需要自定义头的上游留的口子）。
+      ...(up.extraHeaders && typeof up.extraHeaders === 'object'
+        ? Object.fromEntries(Object.entries(up.extraHeaders).map(([k, v]) => [String(k), String(v)]))
+        : {}),
     },
-  }, (upRes) => {
+  };
+  // 响应处理提成独立函数，重试时新请求直接复用
+  const onUpstreamRes = (upRes) => {
     res.writeHead(200, {
       'content-type': 'text/event-stream;charset=UTF-8',
       'cache-control': 'no-cache',
@@ -724,22 +901,46 @@ function serveCustomModel(req, res, decodedText, cfg, rawBody) {
       log({ kind: 'custom-serve-end', emittedChars, sawFinish });
       res.end();
     });
-  });
-  upstreamReq.on('error', (e) => {
-    log({ kind: 'custom-serve-error', message: e.message });
-    if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(envelope({ error: { code: 'upstream_error', message: e.message } }));
-    emitVisibleFailure(res, `无法连接上游 ${up.target || ''}：${e.message}`);
-    res.end();
-  });
-  upstreamReq.end(payload);
+  };
+  const sendUpstream = (attempt) => {
+    const upstreamReq = transport.request(upstreamReqOpts, onUpstreamRes);
+    upstreamReq.on('error', (e) => {
+      const detail = String((e && e.message) || (e && e.code) || (e && e.name) || e);
+      const nested = (e && Array.isArray(e.errors)) ? e.errors.map((x) => x.code || x.message).filter(Boolean).join(',') : '';
+      log({ kind: 'custom-serve-error', attempt, message: String((e && e.message) || ''), code: String((e && e.code) || (e && e.name) || ''), nested: nested || undefined });
+      // 走着本地代理时连不上代理（Clash 被关/失联）→ 立即降级直连，
+      // 下一次重试的 createConnection 读到的就是 null（直连），不用等探测周期。
+      if (UPSTREAM_PROXY && /ECONNREFUSED/.test(String(e && e.code))) dropOutboundProxy(String(e && e.code));
+      // 尚未收到响应头 + 瞬时网络错误 → 短间隔重发，IDE 端无感
+      if (attempt < MAX_UPSTREAM_ATTEMPTS && !res.headersSent && isTransientUpstreamError(e)) {
+        log({ kind: 'custom-serve-retry', attempt, code: detail });
+        setTimeout(() => sendUpstream(attempt + 1), 300 * attempt);
+        return;
+      }
+      if (!res.headersSent) res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(envelope({ error: { code: 'upstream_error', message: detail } }));
+      emitVisibleFailure(res, `无法连接上游 ${up.target || ''}：${detail}`);
+      res.end();
+    });
+    upstreamReq.end(payload);
+  };
+  sendUpstream(1);
 }
 
 
 let seq = 0;
+// 日志尺寸上限：超过就把整份挪成 proxy.log.1（旧 .1 先删），日志占用封顶两份。
+const LOG_MAX_BYTES = 10 * 1024 * 1024;
 function log(entry) {
   entry.at = new Date().toISOString();
   entry.id = (++seq).toString(36);
+  try {
+    const st = fs.statSync(LOG);
+    if (st.size > LOG_MAX_BYTES) {
+      try { fs.unlinkSync(LOG + '.1'); } catch { /* 没有旧档就直接挪 */ }
+      fs.renameSync(LOG, LOG + '.1');
+    }
+  } catch { /* 文件还没建，忽略 */ }
   fs.appendFileSync(LOG, JSON.stringify(entry) + '\n');
   return entry.id;
 }
@@ -899,16 +1100,26 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && (req.url === '/state' || req.url === '/api/state')) {
     const cfg = loadConfig();
     const up = (cfg && cfg.upstream) || {};
+    // 能力字段来自 sqlite 模型记录（sync-model.js 写入）；IDE 轮询器据此热同步，
+    // 控制台切上游（自动 sync）后 3s 内生效，无需重启 IDE。
+    const recs = readModelRecord();
+    const rid = (cfg && cfg.recordId) || 'model_mocktest';
+    const rec = Array.isArray(recs) ? recs.find((x) => x && x.id === rid) : null;
     res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
     res.end(JSON.stringify({
       ok: true,
       model: up.model || '',
       displayName: up.displayName || up.model || '',
-      recordId: cfg.recordId || 'model_mocktest',
+      recordId: rid,
       baseUrl: up.baseUrl || '',
       reasoningEffort: up.reasoningEffort || null,
       maxTokens: up.maxTokens || null,
       upstreamHost: (() => { try { return new URL(up.baseUrl).host; } catch { return ''; } })(),
+      is_vl: !!(rec && rec.is_vl),
+      is_reasoning: !!(rec && rec.is_reasoning),
+      max_input_tokens: (rec && rec.max_input_tokens) || 0,
+      max_output_tokens: (rec && rec.max_output_tokens) || 0,
+      thinkingConfig: (rec && rec.thinkingConfig) || null,
     }));
     return;
   }
@@ -920,8 +1131,10 @@ server.on('connect', (req, clientSocket, head) => {
   const [host, portStr] = (req.url || '').split(':');
   const port = Number(portStr || 443);
   clientSocket.on('error', () => {});
+  const mitmSet = mitmHostsNow();
 
-  if (!MITM_HOSTS.has(host)) {
+  if (!mitmSet.has(host)) {
+    log({ kind: 'tunnel', host, port });
     // transparent tunnel; optionally chained through UPSTREAM_PROXY
     if (!UPSTREAM_PROXY) {
       const up = net.connect(port, host, () => {
@@ -938,6 +1151,15 @@ server.on('connect', (req, clientSocket, head) => {
       up.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
     });
     let established = false;
+    up.on('error', (e) => {
+      // 本地代理失联（Clash 被关）：降级直连并直接重连一次，IDE 端这条隧道无感
+      if (!established && /ECONNREFUSED/.test(String(e && e.code))) {
+        dropOutboundProxy('tunnel-econnrefused');
+        clientSocket.destroy();
+        return;
+      }
+      clientSocket.destroy();
+    });
     up.on('data', (chunk) => {
       if (!established) {
         const marker = chunk.indexOf('\r\n\r\n');
@@ -951,7 +1173,6 @@ server.on('connect', (req, clientSocket, head) => {
       clientSocket.write(chunk);
     });
     clientSocket.on('data', (d) => up.write(d));
-    up.on('error', () => clientSocket.destroy());
     clientSocket.on('error', () => up.destroy());
     return;
   }
@@ -963,7 +1184,10 @@ server.on('connect', (req, clientSocket, head) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  const _chain = UPSTREAM_PROXY ? `${UPSTREAM_PROXY.host}:${UPSTREAM_PROXY.port}` : 'direct';
+  const _chain = UPSTREAM_PROXY_FIXED
+    ? `${UPSTREAM_PROXY_FIXED.host}:${UPSTREAM_PROXY_FIXED.port}`
+    : (UPSTREAM_PROXY_FORCED_DIRECT ? 'direct'
+      : `auto(${UPSTREAM_PROXY ? `${UPSTREAM_PROXY.host}:${UPSTREAM_PROXY.port}` : 'direct, probing'})`);
   log({ kind: 'listening', port: PORT, upstream: _chain, mitm: [...MITM_HOSTS] });
   console.log(`proxy listening on 127.0.0.1:${PORT} -> ${_chain}`);
 });

@@ -8,6 +8,7 @@
 //   node experts-patch.js [--dry] [--root "D:\Qoder IDE"] [--quest] [--only=P1,P2] [--skip=P8]
 const fs = require('fs');
 const path = require('path');
+const Q = require('./qoder-paths');
 
 const argv = process.argv.slice(2);
 const DRY = argv.includes('--dry');
@@ -20,16 +21,19 @@ const argOf = (name) => {
 const ONLY = argOf('only') ? argOf('only').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) : null;
 const SKIP = argOf('skip') ? argOf('skip').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) : [];
 const rootIdx = argv.indexOf('--root');
-const ROOT = rootIdx >= 0 ? argv[rootIdx + 1] : 'D:\\Qoder IDE';
+const ROOT = rootIdx >= 0 ? argv[rootIdx + 1] : (Q.IS_MAC ? '/Applications/Qoder CN IDE.app' : 'D:\\Qoder IDE');
+// 兼容三种传法（.app / Contents / 旧式 Windows root），统一解析到 app 目录
+const APP = Q.appDirOf(ROOT);
 
 const FILES = [
-  path.join(ROOT, 'resources/app/out/lingma/agents-window/agents-window.desktop.main.js'),
-  path.join(ROOT, 'resources/app/out/vs/workbench/workbench.desktop.main.js'),
+  path.join(APP, 'out/lingma/agents-window/agents-window.desktop.main.js'),
+  path.join(APP, 'out/vs/workbench/workbench.desktop.main.js'),
 ];
 
 // 每条补丁的开关存在 qoder-proxy/config.json 的 patches 字段里（Web 控制台可单独启停）。
 // 没配置过的默认启用。命令行 --only / --skip 优先级高于配置文件。
-const CONFIG_PATH = path.join(__dirname, 'qoder-proxy', 'config.json');
+// 修正：原来拼的是 scripts/qoder-proxy/config.json（不存在），补丁开关永远读不到
+const CONFIG_PATH = path.join(__dirname, '..', 'qoder-proxy', 'config.json');
 function patchToggles() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).patches || {}; } catch { return {}; }
 }

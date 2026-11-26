@@ -6,21 +6,23 @@ import { state, subscribe } from '../store.js';
 import { Card, Icon, KVList, Badge, SectionTitle } from '../components.js';
 import { bindAll, unbindAll } from '../view-bind.js';
 
-const STEPS = [
+const getSteps = () => [
   { t: '配置上游', d: '在「上游配置」填 Base URL、API Key，从下拉里选模型' },
-  { t: '应用补丁', d: '在「补丁管理」点「应用补丁」，需要管理员权限，Qoder 会被关闭' },
+  { t: '应用补丁', d: `在「补丁管理」点「应用补丁」${state.isMac ? '（无需提权）' : '，需要管理员权限'}，Qoder 会被关闭` },
   { t: 'IDE 走代理', d: '在「状态概览」点「IDE 走代理」，把 IDE 指向本地代理' },
   { t: '重启 Qoder', d: '重启后即可在 IDE 里看到并使用第三方模型' },
 ];
 
-const QA = [
+const getQA = () => [
   {
     q: '如何切换模型？',
     a: '去「上游配置」，点当前生效的那套配置，在「模型」下拉里选一个，保存即生效。模型清单、上下文长度、思考等级都由「模型能力」页对比查看。',
   },
   {
     q: '补丁应用失败怎么办？',
-    a: '先确认 Qoder 已完全退出（任务管理器里没有 Qoder 进程）。补丁需要管理员权限，UAC 弹窗要点「是」。仍失败时看「日志」页的报错，或先「回滚全部补丁」再重新应用。',
+    a: state.isMac
+      ? '先确认 Qoder 已完全退出（活动监视器里没有 Qoder 进程）。仍失败时看「日志」页的报错，或先「回滚全部补丁」再重新应用。'
+      : '先确认 Qoder 已完全退出（任务管理器里没有 Qoder 进程）。补丁需要管理员权限，UAC 弹窗要点「是」。仍失败时看「日志」页的报错，或先「回滚全部补丁」再重新应用。',
   },
   {
     q: '代理连不上怎么办？',
@@ -76,7 +78,9 @@ const QA = [
   },
   {
     q: '控制台提示「代理证书未信任」/ Qoder 连不上代理？',
-    a: '代理要给 api3.qoder.sh 出示自己签的证书，系统不认它 Qoder 就连不上。到「维护 → 环境状态」点「信任证书」，Windows 会弹一个「安全警告」框，选「是」即可（装的是当前用户，不需要管理员）。装完状态变成「已信任」，重启 Qoder 生效。首次启动代理时如果证书不存在会自动生成一套，所以只会有「未信任」，不会有「没有证书」。',
+    a: state.isMac
+      ? '代理要给 api3.qoder.sh 出示自己签的证书，系统不认它 Qoder 就连不上。到「维护 → 环境状态」点「信任证书」，系统会弹钥匙串确认（输入登录密码，装进当前用户的登录钥匙串，不需要 sudo）。装完状态变成「已信任」，重启 Qoder 生效。首次启动代理时如果证书不存在会自动生成一套，所以只会有「未信任」，不会有「没有证书」。'
+      : '代理要给 api3.qoder.sh 出示自己签的证书，系统不认它 Qoder 就连不上。到「维护 → 环境状态」点「信任证书」，Windows 会弹一个「安全警告」框，选「是」即可（装的是当前用户，不需要管理员）。装完状态变成「已信任」，重启 Qoder 生效。首次启动代理时如果证书不存在会自动生成一套，所以只会有「未信任」，不会有「没有证书」。',
   },
   {
     q: 'Qoder 菜单标题变成 {0} {1} 这种占位符？',
@@ -136,7 +140,7 @@ export default {
       subtitle: '从零到能用，四步',
       icon: Icon.play,
       iconVariant: 'accent',
-      children: STEPS.map(
+      children: getSteps().map(
         (s, i) => `
         <div class="step-item">
           <span class="step-item__num">${i + 1}</span>
@@ -160,7 +164,7 @@ export default {
       subtitle: '点标题展开',
       icon: Icon.help,
       iconVariant: 'violet',
-      children: QA.map(
+      children: getQA().map(
         (x) => `
         <details class="faq-item">
           <summary class="faq-item__q">${chevron}<span>${x.q}</span></summary>

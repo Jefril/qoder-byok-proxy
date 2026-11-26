@@ -6,15 +6,22 @@
     "displayName": "Your Model Name",
     "reasoningEffort": "high",
     "maxTokens": 128000,
-    "contextLength": 1000000
+    "contextLength": 1000000,
+    "extraHeaders": {}
   },
   "serveCustomModels": true,
   "customSourceValues": ["custom", "byok"],
   "injectTools": true,
   "serveWiki": true,
+  "opencode": {
+    "enabled": true,
+    "sessionId": "",
+    "userAgent": ""
+  },
   "recordId": "model_mocktest",
   "proxyPort": 8788,
   "ideProxyPort": 8788,
+  "upstreamProxy": "auto",
   "setupDone": false,
   "activeProfile": "default",
   "profiles": {
